@@ -152,6 +152,7 @@ var spicy = false;
 var rolled = 0;
 var rolling = false;
 var restFrames = 0;
+var snap = null;
 var rollStart = 0;
 var motionOn = false;
 
@@ -396,6 +397,7 @@ function launch(strength, reset){
   vibrate();
   rolling = true;
   restFrames = 0;
+  snap = null;
   rollStart = performance.now();
 
   if (rolled >= 3 && !spicy){
@@ -415,6 +417,8 @@ function launch(strength, reset){
   for (var i = 0; i < 2; i++){
     var b = bodies[i];
     b.wakeUp();
+    b.linearDamping = 0.12;
+    b.angularDamping = 0.12;
     if (reset){
       b.position.set(spots[i][0] + (Math.random()-0.5)*0.3, spots[i][1] + Math.random()*0.4, spots[i][2] + (Math.random()-0.5)*0.3);
       b.quaternion.setFromEuler(
@@ -453,6 +457,47 @@ function upFaceIndex(body){
   if (Math.abs(dy) >= Math.abs(dx) && Math.abs(dy) >= Math.abs(dz)) return dy > 0 ? 2 : 3;
   if (Math.abs(dx) >= Math.abs(dz)) return dx > 0 ? 0 : 1;
   return dz > 0 ? 4 : 5;
+}
+
+// Tip each die flat onto whichever face is most nearly up, sitting on the felt,
+// so a die resting on an edge or leaning on a wall always gives a clear answer.
+var LOCAL_AXES = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+function startSnap(){
+  var bodies = [die1Body, die2Body];
+  snap = { t0: performance.now(), dur: 200, items: bodies.map(function(b){
+    b.velocity.setZero(); b.angularVelocity.setZero();
+    var q0 = new THREE.Quaternion(b.quaternion.x, b.quaternion.y, b.quaternion.z, b.quaternion.w);
+    var ax = LOCAL_AXES[upFaceIndex(b)];
+    var w = new THREE.Vector3(ax[0], ax[1], ax[2]).applyQuaternion(q0);
+    var q1 = new THREE.Quaternion().setFromUnitVectors(w, new THREE.Vector3(0, 1, 0)).multiply(q0);
+    return { b: b, q0: q0, q1: q1, p0: b.position.clone(), p1: new CANNON.Vec3(b.position.x, DIE/2, b.position.z) };
+  })};
+  // keep the two dice from overlapping after they flatten out
+  var A = snap.items[0].p1, B = snap.items[1].p1;
+  var dx = B.x - A.x, dz = B.z - A.z, d = Math.sqrt(dx*dx + dz*dz), min = DIE * 1.5;
+  if (d < min){
+    if (d < 1e-4){ dx = 1; dz = 0; d = 1; }
+    var push = (min - d) / 2;
+    A.x -= dx/d*push; A.z -= dz/d*push; B.x += dx/d*push; B.z += dz/d*push;
+  }
+  var lim = TRAY_HALF - DIE * 0.75;
+  [A, B].forEach(function(p){ p.x = Math.max(-lim, Math.min(lim, p.x)); p.z = Math.max(-lim, Math.min(lim, p.z)); });
+}
+function stepSnap(){
+  var k = Math.min(1, (performance.now() - snap.t0) / snap.dur);
+  var e = 1 - Math.pow(1 - k, 3);
+  var q = new THREE.Quaternion();
+  snap.items.forEach(function(it){
+    q.copy(it.q0).slerp(it.q1, e);
+    it.b.quaternion.set(q.x, q.y, q.z, q.w);
+    it.b.position.set(it.p0.x + (it.p1.x - it.p0.x)*e, it.p0.y + (it.p1.y - it.p0.y)*e, it.p0.z + (it.p1.z - it.p0.z)*e);
+    it.b.velocity.setZero(); it.b.angularVelocity.setZero();
+  });
+  if (k >= 1){
+    snap.items.forEach(function(it){ it.b.sleep(); });
+    snap = null;
+    showResult();
+  }
 }
 
 function showResult(){
@@ -563,22 +608,22 @@ function animate(){
   die2Mesh.position.copy(die2Body.position);
   die2Mesh.quaternion.copy(die2Body.quaternion);
 
-  if (rolling){
+  if (rolling && snap){
+    stepSnap();
+  } else if (rolling){
     var b1 = die1Body, b2 = die2Body;
+    var age = performance.now() - rollStart;
+    // once a die slows down, brake it hard so it doesn't creep or rock for ages
+    [b1, b2].forEach(function(b){
+      var slow = b.velocity.length() < 1.2 && b.position.y < DIE;
+      b.linearDamping = slow ? 0.6 : 0.12;
+      b.angularDamping = slow ? 0.6 : 0.12;
+    });
     var still =
-      b1.velocity.length() < 0.08 && b2.velocity.length() < 0.08 &&
-      b1.angularVelocity.length() < 0.1 && b2.angularVelocity.length() < 0.1;
-    if (still){
-      restFrames++;
-    } else {
-      restFrames = 0;
-    }
-    var timeout = performance.now() - rollStart > 20000;
-    if (restFrames > 45 || timeout){
-      b1.velocity.setZero(); b2.velocity.setZero();
-      b1.angularVelocity.setZero(); b2.angularVelocity.setZero();
-      showResult();
-    }
+      b1.velocity.length() < 0.35 && b2.velocity.length() < 0.35 &&
+      b1.angularVelocity.length() < 0.9 && b2.angularVelocity.length() < 0.9;
+    restFrames = still ? restFrames + 1 : 0;
+    if ((age > 500 && restFrames > 6) || age > 4000) startSnap();
   }
 
   renderer.render(scene, camera);
